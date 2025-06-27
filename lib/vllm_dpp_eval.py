@@ -9,6 +9,11 @@ import logging
 from dataclasses import dataclass
 from tqdm import tqdm
 
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logging.info("Logging is now ON")
+
 @dataclass
 class VLLM_DPP_Evalutation_FrameWork:
     model_id: str
