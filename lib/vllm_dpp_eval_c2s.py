@@ -16,9 +16,25 @@ def add_parent_dir_to_sys_path(parent_depth: int = 1):
     if parent_dir not in sys.path:
         sys.path.append(parent_dir)
 
-
+add_parent_dir_to_sys_path(0)
 add_parent_dir_to_sys_path(1) # Ensure parent directory is in sys.path
 
+# Redirect HF cache to scratch
+# redirect all HF & Datasets caches into your home scratch
+user = os.getenv("USER")
+
+# where you have write permission
+hf_cache_dir       = f"/home/{user}/scratch/bio_transcoder_data/hf_cache"
+hf_datasets_cache  = f"/home/{user}/scratch/bio_transcoder_data/hf_datasets_cache"
+
+# create them if they don’t exist
+os.makedirs(hf_cache_dir,      exist_ok=True)
+os.makedirs(hf_datasets_cache, exist_ok=True)
+
+# point Transformers and Datasets at these
+os.environ["HF_HOME"]             = hf_cache_dir
+os.environ["TRANSFORMERS_CACHE"]  = hf_cache_dir
+os.environ["HF_DATASETS_CACHE"]   = hf_datasets_cache
 
 import multiprocessing as mp
 import glob, os
@@ -36,25 +52,6 @@ logging.basicConfig(
 logging.info("Starting C2S vLLM DPP inference")
 
 if __name__ == "__main__":
-    
-
-    # Redirect HF cache to scratch
-    # redirect all HF & Datasets caches into your home scratch
-    user = os.getenv("USER")
-
-    # where you have write permission
-    hf_cache_dir       = f"/home/{user}/scratch/bio_transcoder_data/hf_cache"
-    hf_datasets_cache  = f"/home/{user}/scratch/bio_transcoder_data/hf_datasets_cache"
-
-    # create them if they don’t exist
-    os.makedirs(hf_cache_dir,      exist_ok=True)
-    os.makedirs(hf_datasets_cache, exist_ok=True)
-
-    # point Transformers and Datasets at these
-    os.environ["HF_HOME"]             = hf_cache_dir
-    os.environ["TRANSFORMERS_CACHE"]  = hf_cache_dir
-    os.environ["HF_DATASETS_CACHE"]   = hf_datasets_cache
-
     mp.set_start_method("spawn", force=True)
 
     # 1) Load your C2S Arrow split
