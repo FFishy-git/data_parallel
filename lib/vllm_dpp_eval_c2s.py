@@ -17,13 +17,13 @@ def add_parent_dir_to_sys_path(parent_depth: int = 1):
         sys.path.append(parent_dir)
 
 
-add_parent_dir_to_sys_path(2) # Ensure parent directory is in sys.path
+add_parent_dir_to_sys_path(1) # Ensure parent directory is in sys.path
 
 
 import multiprocessing as mp
 import glob, os
 from datasets import load_dataset, Dataset
-from data_parallel.lib.data_parallel.dpp import DataIterator
+from data_parallel.dpp import DataIterator
 from vllm_dpp_eval  import VLLM_DPP_Evalutation_FrameWork  # wherever you defined it
 import logging
 
