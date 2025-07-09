@@ -9,20 +9,19 @@ import logging
 from dataclasses import dataclass
 from tqdm import tqdm
 
-
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
-logging.info("Logging is now ON")
-
 @dataclass
 class VLLM_DPP_Evalutation_FrameWork:
     model_id: str
     max_new_tokens: int
     temperature: float
+    
     batch_size: int
     gpus_per_worker: int
     max_queue_size: int
     
+    tokenizer: str | None = None
+    top_p: float = 1.0
+    top_k: int = 40
     # debug features
     first_n_batches: int | None = None
     
@@ -39,8 +38,11 @@ class VLLM_DPP_Evalutation_FrameWork:
         )
         worker_config = VLLMWorkerConfig(
             model_id=self.model_id,
+            tokenizer=self.tokenizer,
             max_new_tokens=self.max_new_tokens,
             temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
         )
         
         num_workers = pipeline_config.num_gpus // pipeline_config.gpus_per_worker
@@ -70,39 +72,50 @@ class VLLM_DPP_Evalutation_FrameWork:
             all_results = [[] for _ in range(total_batches)]
             total_samples_processed = 0
             
-            # Create progress bar
-            with tqdm(total=total_batches, desc="Processing batches", unit="batch") as pbar:
+            # Create progress bar with multiprocessing-friendly settings
+            import sys
+            with tqdm(total=total_batches, desc="Processing batches", unit="batch", 
+                     file=sys.stdout, dynamic_ncols=True, miniters=1, mininterval=0.1) as pbar:
                 for i, (batch_idx, results) in enumerate(pipeline.run(data_iterator=data_iterator, stream_results=False)):
+                    
                     all_results[batch_idx] = results
                     total_samples_processed += len(results) if results else 0
                     
-                    # Update progress bar
+                    # Update progress bar immediately
                     pbar.update(1)
                     pbar.set_postfix({
-                        'returned_batch_idx': i,
+                        'batch_idx': batch_idx,
                         'batch_size': len(results) if results else 0,
-                        'samples_processed': total_samples_processed,
-                        'total_samples': total_samples,
-                        'progress': f"{total_samples_processed}/{total_samples}"
+                        'samples': f"{total_samples_processed}/{total_samples}"
                     })
                     
-                    # Log first batch result for debugging
-                    if batch_idx == 0 and results:
-                        logging.debug(f"First returned batch result sample: {results[0]}")
-                        print(f"Result of first sample: {results[0]}")
+                    # Force flush to ensure immediate display
+                    pbar.refresh()
+                    sys.stdout.flush()
                     
-                    # # Log every 10th batch for monitoring
-                    # if len(all_results) % 10 == 0:
-                    #     logging.info(f"Processed {len(all_results)}/{total_batches} batches ({total_samples_processed}/{total_samples} samples)")
+                    # Add timestamped logging to verify streaming
+                    import time
+                    current_time = time.strftime("%H:%M:%S")
+                    if i % 5 == 0:  # Log every 5th batch
+                        logging.info(f"[{current_time}] Received batch {batch_idx} (iteration {i}) with {len(results) if results else 0} results")
+                
+                # Log first batch result for debugging
+                if batch_idx == 0 and results:
+                    # logging.info(f"prompt[0]:\n{preprocess_fn(dataset[0])}")
+                    logging.info(f"results[0]:\n{results[0]}")
+                
+                # # Log every 10th batch for monitoring
+                # if len(all_results) % 10 == 0:
+                #     logging.info(f"Processed {len(all_results)}/{total_batches} batches ({total_samples_processed}/{total_samples} samples)")
             
-            logging.info(f"\nTotal results collected: {len(all_results)}")
+            logging.info(f"Total results collected: {len(all_results)}")
             logging.info(f"Total samples processed: {total_samples_processed}")
             logging.info(f"Pipeline completed successfully. Total batches: {len(all_results)}, Total samples: {total_samples_processed}")
             
         except Exception as e:
             logging.error(f"An error occurred during pipeline execution: {e}", exc_info=True)
-        finally:
-            pipeline.shutdown()
+        # finally:
+        #     pipeline.shutdown()
             
         # all_results is a list of lists, each list contains the results of a batch. Let us flatten it.
         all_results = [item for sublist in all_results for item in sublist]
@@ -121,6 +134,7 @@ if __name__ == "__main__":
         model_id=model_id,
         max_new_tokens=1024,
         temperature=0.0,
+        top_p=0.95,
         batch_size=32,  # Reduced batch size for better stability
         gpus_per_worker=1,
         max_queue_size=128  # Reduced queue size

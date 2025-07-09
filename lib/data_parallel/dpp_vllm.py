@@ -11,9 +11,11 @@ import os
 @dataclass
 class VLLMWorkerConfig(WorkerConfig):
     model_id: str
+    tokenizer: str | None = None
     max_new_tokens: int = 512
     temperature: float = 0.0
     top_p: float = 1.0
+    top_k: int = -1 # -1 means all tokens are considered
     gpu_memory_utilization: float = 0.9
     trust_remote_code: bool = True
     enforce_eager: bool = True
@@ -64,7 +66,7 @@ class VLLMInferenceWorker(DataParallelWorker):
         # Add additional VLLM options to handle Gemma3 compatibility issues
         vllm_kwargs = {
             "model": self.worker_config.model_id,
-            "tokenizer": self.worker_config.model_id,
+            # "tokenizer": self.worker_config.tokenizer if hasattr(self.worker_config, "tokenizer") else self.worker_config.model_id,
             "tensor_parallel_size": tensor_parallel_size,
             "gpu_memory_utilization": self.worker_config.gpu_memory_utilization,
             "enforce_eager": self.worker_config.enforce_eager,
@@ -96,7 +98,7 @@ class VLLMInferenceWorker(DataParallelWorker):
             # Try with more conservative settings
             logging.info("Retrying with more conservative settings...")
             vllm_kwargs.update({
-                "dtype": "float16",
+                "dtype": "bfloat16",
                 "max_model_len": 4096,
                 "gpu_memory_utilization": 0.7,
                 "max_num_batched_tokens": 2048,
@@ -107,15 +109,25 @@ class VLLMInferenceWorker(DataParallelWorker):
         self.sampling_params = SamplingParams(
             temperature=self.worker_config.temperature,
             top_p=self.worker_config.top_p,
+            top_k=self.worker_config.top_k,
             max_tokens=self.worker_config.max_new_tokens,
         )
         logging.info("Model and sampling params initialized.")
 
     def process_batch(self, batch: List[str]) -> List[Dict[str, str]]:
         logging.debug(f"Processing batch: {batch}")
-        outputs = self.model.generate(batch, self.sampling_params, use_tqdm=False)
-        logging.debug(f"model.generate() outputs: {outputs}")
-        return [{"prompt": o.prompt, "generated_text": o.outputs[0].text} for o in outputs]
+        try:
+            outputs = self.model.generate(batch, self.sampling_params, use_tqdm=False)
+            logging.debug(f"model.generate() outputs: {outputs}")
+            # Normal case: outputs are objects with attributes
+            return [{"prompt": o.prompt, "generated_text": o.outputs[0].text} for o in outputs]
+        except Exception as e:
+            logging.error(f"Failed to generate outputs for batch: {e}")
+            # Fallback case: create empty outputs as dictionaries
+            fallback_outputs = [{"prompt": p, "outputs": [{"text": ""}]} for p in batch]
+            logging.debug(f"Using fallback outputs: {fallback_outputs}")
+            # Handle fallback outputs as dictionaries
+            return [{"prompt": o["prompt"], "generated_text": o["outputs"][0]["text"]} for o in fallback_outputs]
 
 if __name__ == "__main__":
     from lib.data_parallel.dpp import DataIterator

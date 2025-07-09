@@ -24,7 +24,7 @@ import multiprocessing as mp
 import glob, os
 from datasets import load_dataset, Dataset
 from data_parallel.dpp import DataIterator
-from vllm_dpp_eval  import VLLM_DPP_Evalutation_FrameWork  # wherever you defined it
+from data_parallel.vllm_dpp_eval import VLLM_DPP_Evalutation_FrameWork  # wherever you defined it
 import logging
 
 # 1) Configure logging before anything else uses it

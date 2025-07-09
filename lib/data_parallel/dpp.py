@@ -32,9 +32,9 @@ class PipelineConfig:
     
     # queue config
     max_queue_size: int = 256  # Default value, can be overridden when instantiating
-    fetching_task_timeout: float = 60.0
-    fetching_result_timeout: float = 300.0
-    worker_setup_timeout: float = 300.0
+    fetching_task_timeout: float = 1800.0
+    fetching_result_timeout: float = 600.0
+    worker_setup_timeout: float = 1800.0
     sequential_worker_setup: bool = False   # if True, the workers will be setup sequentially, otherwise, they will be setup in parallel
 
 # --- Universal Data Iterator Class ---
@@ -149,6 +149,9 @@ class DataIterator:
             "Supported types are: list, torch.utils.data.Dataset, "
             "datasets.Dataset, tf.data.Dataset."
         )
+        
+    def __len__(self):
+        return len(self.dataset)
 
 
 # --- Generic Data Parallelism Class ---
@@ -280,31 +283,39 @@ class DataParallelPipeline:
             worker.setup()
             torch.cuda.synchronize()
             setup_queue.put(worker_index)
-
+            
+            batch_idx = -1
             while True:
                 try:
+                    logging.info(f"Waiting for next task to arrive in the task queue...")
                     task = task_queue.get(timeout=fetching_task_timeout)
                     if task is None:
+                        logging.info(f"Received shutdown signal. Exiting.")
                         break
-                    batch_idx, batch_data = task
+                    batch_idx, batch_data, batch_args = task
+                    logging.info(f"Received batch {batch_idx} with {len(batch_data)} items for processing.")
                     start_time = time.time()
                     results = worker.process_batch(batch_data)
                     duration = time.time() - start_time
-                    logging.info(f"Worker {worker_index} processed batch {batch_idx} in {duration:.2f}s.")
+                    
+                    # post process results if needed
+                    if batch_args.get('batch_size', len(results)) < len(results):
+                        results = results[:batch_args['batch_size']]  # trim results to batch size
+                    logging.info(f"processed batch {batch_idx} in {duration:.2f}s.")
                     result_queue.put((batch_idx, worker_index, results))
                 except Empty:
-                    logging.warning(f"Worker {worker_index} timed out waiting for a task.")
+                    logging.warning(f"timed out waiting for a task.")
                     continue
                 except Exception as e:
-                    logging.error(f"Error in worker {worker_index} processing batch: {e}", exc_info=True)
+                    logging.error(f"Error in processing batch: {e}", exc_info=True)
                     if 'batch_idx' in locals():
                         result_queue.put((batch_idx, worker_index, None))
         except Exception as e:
-            logging.error(f"Failed to initialize or run worker {worker_index}: {e}", exc_info=True)
+            logging.error(f"Failed to initialize or run worker: {e}", exc_info=True)
         finally:
             if worker: worker.cleanup()
             torch.cuda.empty_cache()
-            logging.info(f"Worker {worker_index} process finished.")
+            logging.info(f"Process finished.")
 
     @staticmethod
     def _setup_worker_logging(worker_index: int, main_log_format: str = None, main_log_datefmt: str = None, main_log_level: int = None):
@@ -334,66 +345,165 @@ class DataParallelPipeline:
         for handler in root_logger.handlers:
             handler.setFormatter(formatter)
 
-    def run(self, data_iterator: Iterator[List[Any]], stream_results:bool=False) -> Generator[Any, None, None]:
-        dp_master_port = get_open_port()
-        dp_master_ip = "127.0.0.1"
+    def run(self, 
+            data_iterator: Iterator[List[Any]],
+            stream_results: bool = False, 
+            auto_batch_fill: bool = True
+            ) -> Generator[Any, None, None]:
         
-        # Capture main process logging configuration
-        root_logger = logging.getLogger()
-        main_log_format = None
-        main_log_datefmt = None
-        main_log_level = root_logger.level
-        
-        # Try to get the format from the root logger's handlers
-        for handler in root_logger.handlers:
-            if hasattr(handler, 'formatter') and handler.formatter:
-                main_log_format = handler.formatter._fmt
-                main_log_datefmt = handler.formatter.datefmt
-                break
-        
-        for worker_index in range(self.num_workers):
-            p = mp.Process(target=self._worker_process_loop, args=(
-                worker_index, self.num_workers, dp_master_port, dp_master_ip, self.pipeline_config.gpus_per_worker, self.pipeline_config.num_gpus, self.worker_class,
-                self.worker_config, self.task_queue, self.result_queue,
-                self.setup_queue, self.pipeline_config.fetching_task_timeout,
-                main_log_format, main_log_datefmt, main_log_level
-            ))
-            p.start()
-            self.processes.append(p)
+        try: 
+            # Check if we should run in debug mode (single process)
+            if self.pipeline_config.num_gpus == self.pipeline_config.gpus_per_worker:
+                logging.info("Debug mode detected: num_gpus == gpus_per_worker. Running in single process mode.")
+                yield from self.single_process_run(data_iterator, stream_results)
+                return
             
-            if self.pipeline_config.sequential_worker_setup:
-            # NOTE: We should not wait for the first worker to setup, because VLLM will automatically handle that. If we do, the process will hang.
-            # === Alternative: Wait for the first worker to setup, not working for VLLM === #
+            # Multiprocessing mode if num_gpus > gpus_per_worker
+            dp_master_port = get_open_port()
+            dp_master_ip = "127.0.0.1"
+            
+            # Capture main process logging configuration
+            root_logger = logging.getLogger()
+            main_log_format = None
+            main_log_datefmt = None
+            main_log_level = root_logger.level
+            
+            # Try to get the format from the root logger's handlers
+            for handler in root_logger.handlers:
+                if hasattr(handler, 'formatter') and handler.formatter:
+                    main_log_format = handler.formatter._fmt
+                    main_log_datefmt = handler.formatter.datefmt
+                    break
+            
+            for worker_index in range(self.num_workers):
+                p = mp.Process(target=self._worker_process_loop, args=(
+                    worker_index, self.num_workers, dp_master_port, dp_master_ip, self.pipeline_config.gpus_per_worker, self.pipeline_config.num_gpus, self.worker_class,
+                    self.worker_config, self.task_queue, self.result_queue,
+                    self.setup_queue, self.pipeline_config.fetching_task_timeout,
+                    main_log_format, main_log_datefmt, main_log_level
+                ))
+                p.start()
+                self.processes.append(p)
+                
+                if self.pipeline_config.sequential_worker_setup:
+                # NOTE: We should not wait for the first worker to setup, because VLLM will automatically handle that. If we do, the process will hang.
+                # === Alternative: Wait for the first worker to setup, not working for VLLM === #
+                    try:
+                        completed_worker = self.setup_queue.get(timeout=self.pipeline_config.worker_setup_timeout)
+                        logging.info(f"Worker {completed_worker} setup completed.")
+                    except Empty:
+                        raise RuntimeError(f"Worker {worker_index} failed to set up in time.")
+                else:
+                    time.sleep(1)
+
+            # submit jobs to the task queue
+            logging.info(f"All {self.num_workers} workers started. Submitting batches to the task queue...")
+            num_batches_submitted = 0
+            batch_size = None
+            for batch_idx, batch in enumerate(data_iterator):
+                
+                # get the batch size
+                if batch_idx == 0 and batch:
+                    batch_size = len(batch)
+                    if auto_batch_fill:
+                        logging.info(f"First batch size: {batch_size}, auto-filling remaining batches to match this size.")
+                        
+                # auto batch fill logic
+                if auto_batch_fill and batch_size is not None:
+                    actual_batch_size = len(batch)
+                    if actual_batch_size < batch_size:
+                        test_sample = batch[0]
+                        batch += [test_sample] * (batch_size - len(batch))  # fill the batch with the first sample to match the size
+                        
+                        
+                self.task_queue.put((batch_idx, batch, dict(
+                    batch_size=actual_batch_size if auto_batch_fill else len(batch),
+                )))
+                num_batches_submitted += 1
+            for _ in range(self.num_workers): self.task_queue.put(None)  # send shutdown signal to workers
+            logging.info(f"All {num_batches_submitted} batches submitted.")
+
+            num_batches_processed = 0
+            while num_batches_processed < num_batches_submitted:
                 try:
-                    completed_worker = self.setup_queue.get(timeout=self.pipeline_config.worker_setup_timeout)
-                    logging.info(f"Worker {completed_worker} setup completed.")
+                    _batch_idx, _worker_index, results = self.result_queue.get(timeout=self.pipeline_config.fetching_result_timeout)
+                    num_batches_processed += 1
+                    logging.info("Received results for batch %d from worker %d.", _batch_idx, _worker_index)
+                    if results is not None: 
+                        if stream_results: yield from results # stream the results to the caller, no batch structure
+                        else: yield (_batch_idx, results) # return the results in a batch structure
+                    else: logging.error(f"Batch {_batch_idx} from worker {_worker_index} failed.")
                 except Empty:
-                    raise RuntimeError(f"Worker {worker_index} failed to set up in time.")
-            else:
-                time.sleep(1)
+                    logging.error("Timeout waiting for results.")
+                    break
+                
+            logging.info(f"All {num_batches_processed} batches processed.")
+        
+        except Exception as e:
+            logging.error(f"An error occurred during pipeline execution: {e}", exc_info=True)
+            raise
+        finally:
+            self.shutdown()
 
-        num_batches_submitted = 0
-        for batch_idx, batch in enumerate(data_iterator):
-            self.task_queue.put((batch_idx, batch))
-            num_batches_submitted += 1
-        logging.info(f"All {num_batches_submitted} batches submitted.")
+    def single_process_run(self, data_iterator: Iterator[List[Any]], stream_results: bool = False) -> Generator[Any, None, None]:
+        """
+        Run the pipeline in single process mode for debugging.
+        This bypasses multiprocessing and runs everything in the main process.
+        """
+        logging.info("Starting single process run...")
+        logging.info(f"Data iterator length: {len(data_iterator)}")
+        logging.info(f"stream_results: {stream_results}")
+        # Initialize worker in the main process
+        worker = None
+        try:
+            torch.cuda.empty_cache()
+            worker = self.worker_class(self.worker_config, **dict(
+                num_gpus=self.pipeline_config.num_gpus,
+                num_workers=1,  # Single worker in debug mode
+                dp_master_port=0,  # Not used in single process mode
+                dp_master_ip="127.0.0.1",
+                gpus_per_worker=self.pipeline_config.gpus_per_worker,
+                worker_index=0,  # Single worker has index 0
+            ))
+            
+            logging.info("Setting up worker...")
+            worker.setup()
+            torch.cuda.synchronize()
+            logging.info("Worker setup completed.")
 
-        num_batches_processed = 0
-        while num_batches_processed < num_batches_submitted:
-            try:
-                _batch_idx, _worker_index, results = self.result_queue.get(timeout=self.pipeline_config.fetching_result_timeout)
-                num_batches_processed += 1
-                if results is not None: 
-                    if stream_results: yield from results # stream the results to the caller, no batch structure
-                    else: yield (_batch_idx, results) # return the results in a batch structure
-                else: logging.error(f"Batch {_batch_idx} from worker {_worker_index} failed.")
-            except Empty:
-                logging.error("Timeout waiting for results.")
-                break
+            # Process batches directly
+            for batch_idx, batch_data in enumerate(data_iterator):
+                start_time = time.time()
+                try:
+                    results = worker.process_batch(batch_data)
+                    duration = time.time() - start_time
+                    logging.info(f"Processed batch {batch_idx} in {duration:.2f}s.")
+                    
+                    if results is not None:
+                        if stream_results:
+                            yield from results  # stream the results to the caller, no batch structure
+                        else:
+                            yield (batch_idx, results)  # return the results in a batch structure
+                    else:
+                        logging.error(f"Batch {batch_idx} failed.")
+                        
+                except Exception as e:
+                    logging.error(f"Error processing batch {batch_idx}: {e}", exc_info=True)
+                    if not stream_results:
+                        yield (batch_idx, None)
+                        
+        except Exception as e:
+            logging.error(f"Failed to initialize or run worker: {e}", exc_info=True)
+        finally:
+            if worker:
+                logging.info("Cleaning up worker...")
+                worker.cleanup()
+            torch.cuda.empty_cache()
+            logging.info("Single process run completed.")
 
     def shutdown(self):
-        logging.info("Shutting down pipeline...")
-        for _ in range(self.num_workers): self.task_queue.put(None)
+        logging.info("Shutting down dpp pipeline...")
+        
         for p in self.processes:
             p.join(timeout=60)
             if p.is_alive():
@@ -402,7 +512,7 @@ class DataParallelPipeline:
         self.task_queue.close()
         self.result_queue.close()
         self.setup_queue.close()
-        logging.info("Pipeline shutdown complete.")
+        logging.info("DPP pipeline shutdown complete.")
 
 # --- Custom Logging Formatter for Workers ---
 class WorkerLogFormatter(logging.Formatter):
